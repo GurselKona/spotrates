@@ -3,17 +3,16 @@ import numpy as np
 from scipy.interpolate import interp1d
 import time
 
-def calculate_and_force_save():
+def calculate_corrected_rates():
     input_file = 'tbp_bulten.xlsx'
-    # Dosya ismini değiştirdim ki "Dosya açık" hatasına takılmasın
-    output_file = f'sonuc_zero_faizler_V2_{int(time.time())}.xlsx'
+    output_file = f'sonuc_zero_faizler_DUZELTILMIS_{int(time.time())}.xlsx'
 
-    # Verileri saklayacağımız listeler (Hata olsa bile bunları yazdıracağız)
-    target_results = []
-    verification_data = []
+    target_results = []      
+    curve_data = []          
+    bond_audit_data = []     
 
     try:
-        print("--- İŞLEM BAŞLIYOR ---")
+        print("--- HESAPLAMA SÜRECİ (DÜZELTİLMİŞ) ---")
         
         # 1. VERİ OKUMA
         df_date = pd.read_excel(input_file, header=None, nrows=1)
@@ -28,31 +27,39 @@ def calculate_and_force_save():
         instruments['kalan_gun'] = (instruments['vade'] - ref_date).dt.days
         
         instruments = instruments[instruments['kalan_gun'] > 0].sort_values(by='kalan_gun')
-        print(f"İşlenecek Enstrüman Sayısı: {len(instruments)}")
 
         # 2. BOOTSTRAP
-        curve_points = [(0, 1.0)]
+        curve_points = [(0, 1.0)] 
 
         for idx, row in instruments.iterrows():
             target_day = row['kalan_gun']
             val = row['fiyat_oran']
             itype = row['tip'].lower()
+            vade_tarihi = row['vade']
             
-            # Repo/Bono/Tahvil mantığı (Özet)
+            # --- A. REPO ---
+            if itype == 'repo':
+                # Repo oranı zaten yüzde gelir (Örn: 45). Formül: 1 / (1 + 45 * gün / 36500)
+                df_calc = 1 / (1 + val * target_day / 36500)
+                curve_points.append((target_day, df_calc))
+                curve_points = sorted(curve_points, key=lambda x: x[0])
+                
+                # Zero Rate hesabı (36500 ile çarptığımız için sonuç 45.0 çıkar)
+                z_rate = (1/df_calc - 1)*(36500/target_day)
+                
+                curve_data.append({
+                    'Tip': 'REPO', 'Vade': vade_tarihi, 'Gün': target_day, 
+                    'Fiyat/Oran': val, 'DF': df_calc, 
+                    'Zero Faiz (%)': z_rate # DÜZELTME: *100 Kaldırıldı
+                })
+                continue
+
+            # --- B. HAZIRLIK ---
             cash_flows = []
             market_price = val
             
-            if itype == 'repo':
-                df_calc = 1 / (1 + val * target_day / 36500)
-                curve_points.append((target_day, df_calc))
-                verification_data.append({
-                    'Tip': 'Repo', 'Vade': row['vade'], 'Fiyat': val, 'DF': df_calc
-                })
-                curve_points = sorted(curve_points, key=lambda x: x[0])
-                continue
-
-            elif itype == 'bono':
-                cash_flows.append({'day': target_day, 'amt': 100000})
+            if itype == 'bono':
+                cash_flows.append({'day': target_day, 'amt': 100000, 'date': vade_tarihi})
             
             elif itype == 'tahvil':
                 for i in range(3, 9, 2):
@@ -62,31 +69,24 @@ def calculate_and_force_save():
                         c_date_obj = pd.to_datetime(c_d, dayfirst=True)
                         cdays = (c_date_obj - ref_date).days
                         if 0 < cdays <= target_day:
-                            cash_flows.append({'day': cdays, 'amt': c_a})
-                if cash_flows: 
-                    # Eğer son akış vade günündeyse üzerine ekle, değilse yeni ekle
-                    cash_flows = sorted(cash_flows, key=lambda x: x['day'])
+                            cash_flows.append({'day': cdays, 'amt': c_a, 'date': c_date_obj})
+                
+                cash_flows = sorted(cash_flows, key=lambda x: x['day'])
+                if cash_flows:
                     if cash_flows[-1]['day'] == target_day:
                         cash_flows[-1]['amt'] += 100000
                     else:
-                        cash_flows.append({'day': target_day, 'amt': 100000})
+                        cash_flows.append({'day': target_day, 'amt': 100000, 'date': vade_tarihi})
                 else:
-                     cash_flows.append({'day': target_day, 'amt': 100000})
+                     cash_flows.append({'day': target_day, 'amt': 100000, 'date': vade_tarihi})
 
-            # Solver
+            # --- C. SOLVER ---
             last_day = curve_points[-1][0]
             last_df = curve_points[-1][1]
             
-            # --- ARA BOŞLUK KONTROLÜ (Gap Check) ---
-            # Eğer yeni eklediğin veri çok uzak bir tarihteyse ve arayı dolduramıyorsa
-            # Kod burada "continue" diyip o satırı atlıyor olabilir.
-            # Bunu görmek için uyarı ekliyorum:
             intermediate = [f for f in cash_flows if last_day < f['day'] < target_day]
             if len(intermediate) > 1:
-                print(f"!!! ATLANDI: {row['vade'].date()} (Çok büyük boşluk var, hesaplanmadı)")
-                verification_data.append({
-                    'Tip': 'ATLANDI', 'Vade': row['vade'], 'DF': 0, 'Not': 'Veri Boşluğu'
-                })
+                print(f"UYARI: {vade_tarihi.date()} atlandı (Veri boşluğu).")
                 continue
 
             days_arr = np.array([p[0] for p in curve_points])
@@ -100,22 +100,62 @@ def calculate_and_force_save():
                 if d <= last_day:
                     sum_known += amt * float(interp(d))
                 else:
-                    w = 1.0 if target_day == last_day else (d-last_day)/(target_day-last_day)
-                    sum_const += amt * last_df * (1-w)
+                    w = 1.0 if target_day == last_day else (d - last_day) / (target_day - last_day)
+                    sum_const += amt * last_df * (1 - w)
                     coeff_x += amt * w
             
-            if coeff_x != 0:
-                new_df = (market_price - sum_known - sum_const) / coeff_x
-                curve_points.append((target_day, new_df))
-                curve_points = sorted(curve_points, key=lambda x: x[0])
+            if coeff_x == 0: continue
+            
+            new_df = (market_price - sum_known - sum_const) / coeff_x
+            
+            curve_points.append((target_day, new_df))
+            curve_points = sorted(curve_points, key=lambda x: x[0])
+            
+            z_rate = (1/new_df - 1)*(36500/target_day) if new_df > 0 else 0
+            
+            curve_data.append({
+                'Tip': itype.upper(), 'Vade': vade_tarihi, 'Gün': target_day, 
+                'Fiyat/Oran': val, 'DF': new_df, 
+                'Zero Faiz (%)': z_rate # DÜZELTME: *100 Kaldırıldı
+            })
+
+            # --- D. DETAYLI KUPON DENETİMİ ---
+            if itype in ['tahvil', 'bono']:
+                check_sum = 0
+                for f in cash_flows:
+                    d = f['day']
+                    amt = f['amt']
+                    c_date = f['date']
+                    
+                    final_days_arr = np.array([p[0] for p in curve_points])
+                    final_dfs_arr = np.array([p[1] for p in curve_points])
+                    final_interp_func = interp1d(final_days_arr, final_dfs_arr, kind='linear', fill_value="extrapolate")
+                    
+                    used_df = float(final_interp_func(d))
+                    pv_flow = amt * used_df
+                    check_sum += pv_flow
+                    
+                    flow_z_rate = (1/used_df - 1)*(36500/d) if used_df > 0 else 0
+
+                    bond_audit_data.append({
+                        'Ana Enstrüman': f"{vade_tarihi.date()} {itype.upper()}",
+                        'Enst. Fiyatı': val,
+                        'Akış Tipi': 'Anapara+Kupon' if d == target_day else 'Ara Kupon',
+                        'Akış Tarihi': c_date,
+                        'Akış Günü': d,
+                        'Tutar': amt,
+                        'Kullanılan DF': used_df,
+                        'PV': pv_flow,
+                        'Implied Zero (%)': flow_z_rate # DÜZELTME: *100 Kaldırıldı
+                    })
                 
-                z_rate = (1/new_df - 1)*(36500/target_day) if new_df > 0 else 0
-                verification_data.append({
-                    'Tip': itype.upper(), 'Vade': row['vade'], 'Fiyat': val, 'DF': new_df, 'Zero': z_rate
+                bond_audit_data.append({
+                    'Ana Enstrüman': "--- KONTROL ---", 'Enst. Fiyatı': val,
+                    'PV': check_sum, 'Implied Zero (%)': f"Fark: {check_sum - val:.4f}"
                 })
+                bond_audit_data.append({})
 
         # 3. HEDEFLER
-        print("Hedef vadeler hesaplanıyor...")
         final_days = np.array([p[0] for p in curve_points])
         final_dfs = np.array([p[1] for p in curve_points])
         f_interp = interp1d(final_days, final_dfs, kind='linear', fill_value="extrapolate")
@@ -123,38 +163,32 @@ def calculate_and_force_save():
         t_dates = pd.to_datetime(df.iloc[:, 11].dropna(), dayfirst=True)
         for td in t_dates:
             days = (td - ref_date).days
-            if days > 0:
+            if days <= 0:
+                df_t, zr = 1.0, 0.0
+            else:
                 df_t = float(f_interp(days))
                 zr = (1/df_t - 1)*(36500/days) if df_t > 0 else 0
-                target_results.append({'Vade': td, 'DF': df_t, 'Zero': zr})
+            
+            target_results.append({
+                'Hedef Vade': td, 'Kalan Gün': days, 
+                'Hesaplanan DF': df_t, 
+                'Zero Faiz (%)': zr # DÜZELTME: *100 Kaldırıldı
+            })
 
     except Exception as e:
-        print(f"\n!!! KRİTİK HATA OLUŞTU: {e}")
+        print(f"HATA: {e}")
         import traceback
         traceback.print_exc()
 
     finally:
-        # HATA OLSA BİLE KAYDET
-        print(f"\n--- KAYIT AŞAMASI ---")
-        if not target_results and not verification_data:
-            print("Kaydedilecek veri oluşmadı! Veri okuma aşamasını kontrol et.")
-        else:
-            try:
-                df1 = pd.DataFrame(target_results)
-                df2 = pd.DataFrame(verification_data)
-                
-                print(f"Yazılacak Hedef Sayısı: {len(df1)}")
-                print(f"Yazılacak Eğri Noktası Sayısı: {len(df2)}")
-                
-                with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-                    df1.to_excel(writer, sheet_name='Hedefler', index=False)
-                    df2.to_excel(writer, sheet_name='Egri_Verisi', index=False)
-                
-                print(f"BAŞARILI: '{output_file}' oluşturuldu.")
-            except PermissionError:
-                print("HATA: Dosya açık olduğu için yazılamadı. Lütfen Excel'i kapatıp tekrar dene.")
-            except Exception as save_err:
-                print(f"Kayıt sırasında hata: {save_err}")
+        if curve_data:
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                pd.DataFrame(target_results).to_excel(writer, sheet_name='Hedef_Vadeler', index=False)
+                pd.DataFrame(curve_data).to_excel(writer, sheet_name='Egri_Verisi', index=False)
+                pd.DataFrame(bond_audit_data).to_excel(writer, sheet_name='Tahvil_Detaylari', index=False)
+            
+            print(f"\nDosya kaydedildi: {output_file}")
+            print("Zero Faizler artık doğru ölçekte (Örn: %45.50 -> 45.50)")
 
 if __name__ == "__main__":
-    calculate_and_force_save()
+    calculate_corrected_rates()
