@@ -35,7 +35,7 @@ def select_instruments_ui():
     root = tk.Tk()
     root.title("Seçim")
     
-    # Pencereyi öne al ve odakla
+    # Pencereyi en öne getir
     root.lift()
     root.attributes('-topmost',True)
     root.after_idle(root.attributes,'-topmost',False)
@@ -59,7 +59,6 @@ def select_instruments_ui():
     tk.Checkbutton(root, text="TAHVİL", variable=var_tahvil).pack(anchor='w', padx=80)
 
     selection = {}
-
     def on_submit():
         selection['repo'] = var_repo.get()
         selection['bono'] = var_bono.get()
@@ -72,7 +71,7 @@ def select_instruments_ui():
 
 # --- 3. ANA PROGRAM ---
 
-def calculate_with_audit():
+def calculate_with_detailed_audit():
     # 1. Arayüz
     user_selection = select_instruments_ui()
     if not user_selection:
@@ -80,12 +79,11 @@ def calculate_with_audit():
         return
 
     input_file = 'tbp_bulten.xlsx'
-    output_file = 'sonuc_zero_curve_audit.xlsx'
+    output_file = 'sonuc_detayli_kontrol.xlsx'
     
-    curve_data = []  # Nihai Eğri Verisi
-    audit_data = []  # Fiyat Kontrol Verisi (Sağlama)
+    curve_data = [] 
 
-    print("--- ZERO CURVE ANALİZİ VE SAĞLAMA ---")
+    print("--- DETAYLI ZERO CURVE ANALİZİ ---")
     print(f"Seçim: {user_selection}")
 
     try:
@@ -119,33 +117,23 @@ def calculate_with_audit():
             val = row['fiyat_oran']
             itype = row['tip']
             
+            # Filtre
             if 'repo' in itype and not user_selection['repo']: continue
             if 'bono' in itype and not user_selection['bono']: continue
             if 'tahvil' in itype and not user_selection['tahvil']: continue
 
             calculated_zero_rate = np.nan
-            calculated_df = np.nan
             
-            # --- A. REPO ---
+            # A. REPO
             if 'repo' in itype:
                 df_calc = 1 / (1 + val * target_day / 36500)
                 curve_points.append((target_day, df_calc))
                 curve_points = sorted(curve_points, key=lambda x: x[0])
                 calculated_zero_rate = (1/df_calc - 1)*(36500/target_day)
-                
-                curve_data.append({
-                    'Tip': 'REPO', 'Gün': target_day, 'Vade': row['vade'],
-                    'DF (Iskonto Faktörü)': df_calc, 'Zero Spot Rate (%)': calculated_zero_rate
-                })
-                
-                # Repo Kontrolü (Faiz üzerinden)
-                audit_data.append({
-                    'Enstrüman': f"REPO {row['vade'].date()}", 'Piyasa Girdisi': val,
-                    'Hesaplanan': calculated_zero_rate, 'Fark': val - calculated_zero_rate
-                })
+                curve_data.append({'Tip': 'REPO', 'Gün': target_day, 'Zero Spot Rate (%)': calculated_zero_rate})
                 continue
 
-            # --- B. BONO/TAHVİL ---
+            # B. BONO/TAHVİL
             cash_flows = []
             market_price = val
             
@@ -163,7 +151,7 @@ def calculate_with_audit():
                     else: cash_flows.append({'day': target_day, 'amt': 100000})
                 else: cash_flows.append({'day': target_day, 'amt': 100000})
 
-            # --- C. SOLVER ---
+            # C. SOLVER
             last_day = curve_points[-1][0]; last_df = curve_points[-1][1]
             intermediate = [f for f in cash_flows if last_day < f['day'] < target_day]
             if len(intermediate) > 1: continue
@@ -189,38 +177,101 @@ def calculate_with_audit():
             curve_points = sorted(curve_points, key=lambda x: x[0])
             calculated_zero_rate = (1/new_df - 1)*(36500/target_day)
             
-            curve_data.append({
-                'Tip': itype.upper(), 'Gün': target_day, 'Vade': row['vade'],
-                'DF (Iskonto Faktörü)': new_df, 'Zero Spot Rate (%)': calculated_zero_rate
-            })
-
-            # --- D. FİYAT SAĞLAMASI (AUDIT) ---
-            # Yeni oluşan eğriyi kullanarak tahvili tekrar fiyatla
-            # Bu işlem Bootstrap'in matematiksel tutarlılığını kanıtlar.
-            
-            # Güncel eğri ile interpolasyon fonksiyonu oluştur
-            final_days = np.array([p[0] for p in curve_points])
-            final_dfs = np.array([p[1] for p in curve_points])
-            check_interp = interp1d(final_days, final_dfs, kind='linear', fill_value="extrapolate")
-            
-            calc_price = 0
-            for f in cash_flows:
-                d = f['day']; amt = f['amt']
-                used_df = float(check_interp(d))
-                calc_price += amt * used_df
-            
-            audit_data.append({
-                'Enstrüman': f"{itype.upper()} {row['vade'].date()}",
-                'Piyasa Girdisi': market_price,
-                'Hesaplanan': calc_price,
-                'Fark': market_price - calc_price
-            })
+            curve_data.append({'Tip': itype.upper(), 'Gün': target_day, 'Zero Spot Rate (%)': calculated_zero_rate})
 
         if not curve_data:
             messagebox.showwarning("Uyarı", "Veri bulunamadı.")
             return
 
-        # 4. MODELLER
+        # 4. DETAYLI SAĞLAMA (AUDIT) - YENİ ÖZELLİK
+        print("Detaylı kupon kontrolü hazırlanıyor...")
+        
+        # Eğrinin son haliyle bir interpolasyon fonksiyonu oluştur
+        final_days = np.array([p[0] for p in curve_points])
+        final_dfs = np.array([p[1] for p in curve_points])
+        check_interp = interp1d(final_days, final_dfs, kind='linear', fill_value="extrapolate")
+        
+        detailed_audit = []
+
+        # Enstrümanları tekrar dön ve hesapla
+        for idx, row in instruments.iterrows():
+            val = row['fiyat_oran']
+            itype = row['tip']
+            target_day = row['kalan_gun']
+            
+            if 'repo' in itype and not user_selection['repo']: continue
+            if 'bono' in itype and not user_selection['bono']: continue
+            if 'tahvil' in itype and not user_selection['tahvil']: continue
+
+            # Repo İçin
+            if 'repo' in itype:
+                df_u = float(check_interp(target_day))
+                pv = 1 * df_u # 1 birim para üzerinden
+                # Repoda fiyat oranı faizdir, PV fiyat değildir. 
+                # O yüzden repoyu sadece DF kontrolü olarak ekleyelim.
+                detailed_audit.append({
+                    'Enstrüman': f"REPO {row['vade'].date()}",
+                    'Akış Tarihi': row['vade'].date(), 'Gün': target_day, 'Tutar': 1.0,
+                    'DF (Eğriden)': df_u, 'PV': '-', 'Not': f"Oran: %{val}"
+                })
+                detailed_audit.append({}) # Boşluk
+                continue
+
+            # Bono/Tahvil İçin
+            cash_flows = []
+            if 'bono' in itype:
+                cash_flows.append({'day': target_day, 'amt': 100000, 'date': row['vade']})
+            elif 'tahvil' in itype:
+                for i in range(3, 9, 2):
+                    c_d = row[f'col_{i}']; c_a = row[f'col_{i+1}']
+                    if pd.notna(c_d) and pd.notna(c_a):
+                        cd_obj = pd.to_datetime(c_d, dayfirst=True)
+                        cdays = (cd_obj - ref_date).days
+                        if 0 < cdays <= target_day: cash_flows.append({'day': cdays, 'amt': c_a, 'date': cd_obj})
+                cash_flows = sorted(cash_flows, key=lambda x: x['day'])
+                if cash_flows:
+                    if cash_flows[-1]['day'] == target_day: cash_flows[-1]['amt'] += 100000
+                    else: cash_flows.append({'day': target_day, 'amt': 100000, 'date': row['vade']})
+                else: cash_flows.append({'day': target_day, 'amt': 100000, 'date': row['vade']})
+
+            # Her bir akışı değerle
+            calc_price_sum = 0
+            bond_name = f"{itype.upper()} {row['vade'].date()}"
+            
+            for f in cash_flows:
+                d = f['day']; amt = f['amt']
+                
+                # Eğriden DF çek
+                used_df = float(check_interp(d))
+                pv_flow = amt * used_df
+                calc_price_sum += pv_flow
+                
+                # Zero karşılığı
+                z_rate = (1/used_df - 1)*(36500/d) if used_df > 0 else 0
+                
+                detailed_audit.append({
+                    'Enstrüman': bond_name,
+                    'Akış Tarihi': f['date'].date() if hasattr(f['date'], 'date') else f['date'],
+                    'Gün': d,
+                    'Tutar': amt,
+                    'DF (Eğriden)': used_df,
+                    'PV (Bugünkü Değer)': pv_flow,
+                    'Implied Zero (%)': z_rate
+                })
+            
+            # Toplam Kontrol Satırı
+            diff = val - calc_price_sum
+            detailed_audit.append({
+                'Enstrüman': '>>> TOPLAM KONTROL',
+                'Akış Tarihi': '---', 'Gün': '---',
+                'Tutar': f"Piyasa: {val}",
+                'DF (Eğriden)': '---',
+                'PV (Bugünkü Değer)': calc_price_sum,
+                'Implied Zero (%)': f"Fark: {diff:.5f}"
+            })
+            detailed_audit.append({}) # Okunabilirlik için boş satır
+
+        # 5. MODELLER VE HEDEFLER
         print("Modeller hesaplanıyor...")
         df_curve = pd.DataFrame(curve_data)
         X_train = df_curve['Gün'].values
@@ -231,7 +282,6 @@ def calculate_with_audit():
         f_poly_reg = np.poly1d(np.polyfit(X_train, y_train, 2))
         nss_params = fit_nss_model(X_train, y_train)
 
-        # 5. HEDEFLER
         target_results = []
         if len(df.columns) > 11:
             t_dates = pd.to_datetime(df.iloc[:, 11].dropna(), dayfirst=True)
@@ -255,9 +305,10 @@ def calculate_with_audit():
             with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
                 pd.DataFrame(target_results).to_excel(writer, sheet_name='Model_Tahminleri', index=False)
                 pd.DataFrame(curve_data).to_excel(writer, sheet_name='Bootstrap_Sonuclari', index=False)
-                pd.DataFrame(audit_data).to_excel(writer, sheet_name='Fiyat_Kontrol_Saglama', index=False)
+                # YENİ EKLENEN SAYFA
+                pd.DataFrame(detailed_audit).to_excel(writer, sheet_name='Detayli_Nakit_Akis_Kontrol', index=False)
             print(f"Başarılı: {output_file}")
-            print("Kontrol için 'Fiyat_Kontrol_Saglama' sayfasına bakınız.")
+            print("Kontrol için 'Detayli_Nakit_Akis_Kontrol' sayfasına bakınız.")
         except PermissionError:
             messagebox.showerror("Hata", "Dosya açık! Kapatıp tekrar dene.")
             return
@@ -267,13 +318,13 @@ def calculate_with_audit():
         max_day = df_curve['Gün'].max() + 100
         x_smooth = np.linspace(1, max_day, 300)
         
-        fig.add_trace(go.Scatter(x=df_curve['Gün'], y=df_curve['Zero Spot Rate (%)'], mode='markers', name='Bootstrap Zero Rates', marker=dict(color='black', size=10)))
+        fig.add_trace(go.Scatter(x=df_curve['Gün'], y=df_curve['Zero Spot Rate (%)'], mode='markers', name='Piyasa Zero Rates (Bootstrap)', marker=dict(color='black', size=10)))
         fig.add_trace(go.Scatter(x=x_smooth, y=[nelson_siegel_svensson(nss_params, t) for t in x_smooth], mode='lines', name='NSS Model', line=dict(color='red', width=3)))
         fig.add_trace(go.Scatter(x=x_smooth, y=f_poly_reg(x_smooth), mode='lines', name='Polinom (2)', line=dict(color='orange', width=2, dash='dash')))
         fig.add_trace(go.Scatter(x=x_smooth, y=f_lin_reg(x_smooth), mode='lines', name='Lin Trend', line=dict(color='blue', width=2, dash='dot')))
         fig.add_trace(go.Scatter(x=x_smooth, y=f_linear(x_smooth), mode='lines', name='Interp', line=dict(color='gray', width=1)))
 
-        fig.update_layout(title=f'Zero Spot Eğrisi - {list(user_selection.values()).count(True)} Tip Seçili', xaxis_title='Gün', yaxis_title='Faiz (%)', template='plotly_white')
+        fig.update_layout(title=f'Zero Spot Eğrisi - Seçim: {[k for k,v in user_selection.items() if v]}', xaxis_title='Gün', yaxis_title='Faiz (%)', template='plotly_white')
         fig.show()
 
     except Exception as e:
@@ -282,4 +333,4 @@ def calculate_with_audit():
         traceback.print_exc()
 
 if __name__ == "__main__":
-    calculate_with_audit()
+    calculate_with_detailed_audit()
